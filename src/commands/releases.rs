@@ -169,7 +169,7 @@ pub fn make_app<'a, 'b: 'a>(app: App<'a, 'b>) -> App<'a, 'b> {
                     .multiple(true)
                     .help("Filenames to delete.")))
             .subcommand(App::new("upload")
-                .about("Upload a file for a release.")
+                .about("Upload files for a release.")
                 .arg(Arg::with_name("dist")
                     .long("dist")
                     .short("d")
@@ -186,11 +186,41 @@ pub fn make_app<'a, 'b: 'a>(app: App<'a, 'b>) -> App<'a, 'b> {
                     .value_name("PATH")
                     .index(1)
                     .required(true)
-                    .help("The path to the file to upload."))
+                    .help("The path to the file or directory to upload."))
                 .arg(Arg::with_name("name")
                     .index(2)
                     .value_name("NAME")
-                    .help("The name of the file on the server.")))
+                    .help("The name of the file on the server."))
+                .arg(Arg::with_name("url_prefix")
+                    .short("u")
+                    .long("url-prefix")
+                    .value_name("PREFIX")
+                    .help("The URL prefix to prepend to all filenames."))
+                .arg(Arg::with_name("url_suffix")
+                    .long("url-suffix")
+                    .value_name("SUFFIX")
+                    .help("The URL suffix to append to all filenames."))
+                .arg(Arg::with_name("ignore")
+                    .long("ignore")
+                    .short("i")
+                    .value_name("IGNORE")
+                    .multiple(true)
+                    .help("Ignores all files and folders matching the given glob"))
+                .arg(Arg::with_name("ignore_file")
+                    .long("ignore-file")
+                    .short("I")
+                    .value_name("IGNORE_FILE")
+                    .help("Ignore all files and folders specified in the given \
+                           ignore file, e.g. .gitignore."))
+                .arg(Arg::with_name("extensions")
+                    .long("ext")
+                    .short("x")
+                    .value_name("EXT")
+                    .multiple(true)
+                    .number_of_values(1)
+                    .help("Set the file extensions that are considered for upload. \
+                           This overrides the default extensions. To add an extension, all default \
+                           extensions must be repeated. Specify once per extension.")))
             .subcommand(App::new("upload-sourcemaps")
                 .about("Upload sourcemaps for a release.")
                 .arg(Arg::with_name("paths")
@@ -672,14 +702,6 @@ fn execute_files_upload<'a>(
     matches: &ArgMatches<'a>,
     version: &str,
 ) -> Result<(), Error> {
-    let path = Path::new(matches.value_of("path").unwrap());
-    let name = match matches.value_of("name") {
-        Some(name) => name,
-        None => Path::new(path)
-            .file_name()
-            .and_then(OsStr::to_str)
-            .ok_or_else(|| err_msg("No filename provided."))?,
-    };
     let dist = matches.value_of("dist");
     let mut headers = vec![];
     if let Some(header_list) = matches.values_of("header") {
@@ -695,21 +717,102 @@ fn execute_files_upload<'a>(
     };
     let org = ctx.get_org()?;
     let project = ctx.get_project_default().ok();
-    if let Some(artifact) = ctx.api.upload_release_file(
-        org,
-        project.as_deref(),
-        &version,
-        &FileContents::FromPath(&path),
-        &name,
-        dist,
-        Some(&headers[..]),
-        ProgressBarMode::Request,
-    )? {
-        println!("A {}  ({} bytes)", artifact.sha1, artifact.size);
-    } else {
-        bail!("File already present!");
+    let path = Path::new(matches.value_of("path").unwrap());
+
+    // Batch files upload
+    if path.is_dir() {
+        let mut builder = WalkBuilder::new(path);
+        builder.git_exclude(false).git_ignore(false).ignore(false);
+
+        let ignores = matches
+            .values_of("ignore")
+            .map(|ignores| ignores.map(|i| format!("!{}", i)).collect::<Vec<_>>());
+        let ignore_file = matches.value_of("ignore_file");
+        let url_prefix = get_url_prefix_from_args(matches);
+        let url_suffix = get_url_suffix_from_args(matches);
+
+        let extensions = matches
+            .values_of("extensions")
+            .map(|extensions| extensions.map(|ext| ext.trim_start_matches('.')).collect())
+            .unwrap_or_else(|| vec![]);
+
+        if !extensions.is_empty() {
+            let mut types_builder = TypesBuilder::new();
+            for ext in &extensions {
+                let ext_name = ext.replace('.', "__");
+                types_builder.add(&ext_name, &format!("*.{}", ext))?;
+            }
+            builder.types(types_builder.select("all").build()?);
+        }
+
+        if let Some(ignore_file) = ignore_file {
+            // This could yield an optional partial error
+            // We ignore this error to match behavior of git
+            builder.add_ignore(ignore_file);
+        }
+
+        if let Some(ref ignores) = ignores {
+            let mut override_builder = OverrideBuilder::new(path);
+            for ignore in ignores {
+                override_builder.add(&ignore)?;
+            }
+            builder.overrides(override_builder.build()?);
+        }
+
+        let mut sources: HashSet<(String, PathBuf)> = HashSet::new();
+
+        for result in builder.build() {
+            let file = result?;
+            if file.file_type().map_or(false, |t| t.is_dir()) {
+                continue;
+            }
+
+            info!(
+                "found: {} ({} bytes)",
+                file.path().display(),
+                file.metadata().unwrap().len()
+            );
+            let local_path = file.path().strip_prefix(&path).unwrap();
+            let url = format!("{}/{}{}", url_prefix, path_as_url(local_path), url_suffix);
+            sources.insert((url.to_string(), file.path().to_path_buf()));
+        }
+
+        ctx.api.upload_release_files(
+            org,
+            project.as_deref(),
+            &version,
+            sources,
+            dist,
+            Some(&headers[..]),
+            ProgressBarMode::Request,
+        )
     }
-    Ok(())
+    // Single file upload
+    else {
+        let name = match matches.value_of("name") {
+            Some(name) => name,
+            None => Path::new(path)
+                .file_name()
+                .and_then(OsStr::to_str)
+                .ok_or_else(|| err_msg("No filename provided."))?,
+        };
+
+        if let Some(artifact) = ctx.api.upload_release_file(
+            org,
+            project.as_deref(),
+            &version,
+            &FileContents::FromPath(&path),
+            &name,
+            dist,
+            Some(&headers[..]),
+            ProgressBarMode::Request,
+        )? {
+            println!("A {}  ({} bytes)", artifact.sha1, artifact.size);
+        } else {
+            bail!("File already present!");
+        }
+        Ok(())
+    }
 }
 
 fn get_url_prefix_from_args<'a, 'b>(matches: &'b ArgMatches<'a>) -> &'b str {

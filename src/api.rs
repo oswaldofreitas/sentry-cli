@@ -10,7 +10,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -18,6 +18,7 @@ use std::sync::Arc;
 use backoff::backoff::Backoff;
 use brotli2::write::BrotliEncoder;
 use chrono::{DateTime, Duration, Utc};
+use console::style;
 use failure::{Backtrace, Context, Error, Fail, ResultExt};
 use flate2::write::GzEncoder;
 use if_chain::if_chain;
@@ -37,7 +38,7 @@ use crate::config::{Auth, Config};
 use crate::constants::{ARCH, EXT, PLATFORM, RELEASE_REGISTRY_LATEST_URL, VERSION};
 use crate::utils::android::AndroidManifest;
 use crate::utils::http::{self, is_absolute_url, parse_link_header};
-use crate::utils::progress::ProgressBar;
+use crate::utils::progress::{make_progress_bar, ProgressBar};
 use crate::utils::retry::{get_default_backoff, DurationAsMilliseconds};
 use crate::utils::sourcemaps::get_sourcemap_reference_from_headers;
 use crate::utils::ui::{capitalize_string, make_byte_progress_bar};
@@ -643,6 +644,87 @@ impl Api {
         } else {
             resp.convert_rnf(ApiErrorKind::ReleaseNotFound)
         }
+    }
+
+    pub fn upload_release_files(
+        &self,
+        org: &str,
+        project: Option<&str>,
+        version: &str,
+        mut sources: HashSet<(String, PathBuf)>,
+        dist: Option<&str>,
+        headers: Option<&[(String, String)]>,
+        _progress_bar_mode: ProgressBarMode, // FIXME
+    ) -> Result<(), Error> {
+        if sources.is_empty() {
+            return Ok(());
+        }
+
+        let mut successful_req = vec![];
+        let mut failed_req = vec![];
+
+        println!(
+            "{} Uploading {} files for release {}",
+            style(">").dim(),
+            style(sources.len()).cyan(),
+            style(version).cyan()
+        );
+
+        let pb = make_progress_bar(sources.len() as u64);
+
+        for (url, path) in sources.drain() {
+            pb.set_message(&path.to_str().unwrap());
+
+            match self.upload_release_file(
+                org,
+                project,
+                version,
+                &FileContents::FromPath(&path),
+                &url.to_owned(),
+                dist,
+                headers,
+                ProgressBarMode::Request,
+            ) {
+                Ok(artifact) => match artifact {
+                    Some(artifact) => {
+                        successful_req.push((path, artifact));
+                    }
+                    None => {
+                        failed_req.push((path, url, String::from("File already present")));
+                    }
+                },
+                Err(err) => {
+                    failed_req.push((path, url, err.to_string()));
+                }
+            };
+
+            pb.inc(1);
+        }
+
+        pb.finish_and_clear();
+
+        for (path, artifact) in successful_req.iter() {
+            println!(
+                "    Successfully uploaded: {} as {} ({}) ({} bytes)",
+                &path.display(),
+                artifact.name,
+                artifact.sha1,
+                artifact.size
+            );
+        }
+
+        for (path, url, reason) in failed_req.iter() {
+            println!(
+                "    Failed to upload: {} as {} ({})",
+                &path.display(),
+                &url,
+                reason
+            );
+        }
+
+        println!("{} Done uploading.", style(">").dim());
+
+        Ok(())
     }
 
     /// Creates a new release.

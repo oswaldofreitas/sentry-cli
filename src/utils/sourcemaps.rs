@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::str;
 use std::sync::Arc;
 
-use console::{style, Term};
+use console::style;
 use failure::{bail, Error};
 use if_chain::if_chain;
 use log::{debug, info, warn};
@@ -25,20 +25,10 @@ use crate::api::{Api, ChunkUploadCapability, ChunkUploadOptions, FileContents, P
 use crate::utils::chunks::{upload_chunks, Chunk, ASSEMBLE_POLL_INTERVAL};
 use crate::utils::enc::decode_unknown_string;
 use crate::utils::fs::{get_sha1_checksums, TempFile};
-use crate::utils::progress::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use crate::utils::progress::{make_progress_bar, ProgressBar, ProgressStyle};
 
 /// Fallback concurrency for release file uploads.
 static DEFAULT_CONCURRENCY: usize = 4;
-
-fn make_progress_bar(len: u64) -> ProgressBar {
-    let pb = ProgressBar::new(len);
-    pb.set_draw_target(ProgressDrawTarget::to_term(Term::stdout(), None));
-    pb.set_style(ProgressStyle::default_bar().template(&format!(
-        "{} {{msg}}\n{{wide_bar}} {{pos}}/{{len}}",
-        style(">").cyan()
-    )));
-    pb
-}
 
 fn is_likely_minified_js(code: &[u8]) -> bool {
     if let Ok(code_str) = decode_unknown_string(code) {
